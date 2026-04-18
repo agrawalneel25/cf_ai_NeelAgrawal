@@ -1,0 +1,11 @@
+name = "cf-ai-chat"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "MEMORY"
+id = "0374c2cae58f4739b7b712cd8989e58d"
+preview_id = "0374c2cae58f4739b7b712cd8989e58d"
