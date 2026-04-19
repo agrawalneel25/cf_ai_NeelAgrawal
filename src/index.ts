@@ -8,6 +8,15 @@ interface Message {
   content: string;
 }
 
+interface SessionData {
+  messages: Message[];
+  summary: string | null;
+}
+
+const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const SUMMARIZE_AFTER = 16;
+const KEEP_RECENT = 8;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -34,18 +43,38 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
   const { message, sessionId } = await request.json() as { message: string; sessionId: string };
 
   const stored = await env.MEMORY.get(sessionId);
-  let history: Message[] = stored ? JSON.parse(stored) : [];
-  history.push({ role: "user", content: message });
+  let session: SessionData = stored ? JSON.parse(stored) : { messages: [], summary: null };
 
-  if (history.length > 20) history = history.slice(history.length - 20);
+  session.messages.push({ role: "user", content: message });
 
-  const aiStream = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-    messages: [{ role: "system", content: "You are a helpful assistant." }, ...history],
+  if (session.messages.length > SUMMARIZE_AFTER) {
+    const toSummarize = session.messages.slice(0, session.messages.length - KEEP_RECENT);
+    const recent = session.messages.slice(session.messages.length - KEEP_RECENT);
+    const prior = session.summary ? "Prior summary: " + session.summary + "\n\n" : "";
+    const text = toSummarize.map(m => m.role + ": " + m.content).join("\n");
+
+    const result = await env.AI.run(MODEL, {
+      messages: [
+        { role: "system", content: "Summarize this conversation in 3-4 sentences. Preserve names, facts, and decisions." },
+        { role: "user", content: prior + text },
+      ],
+    }) as { response: string };
+
+    session.summary = result.response;
+    session.messages = recent;
+  }
+
+  const systemContent = session.summary
+    ? "You are a helpful assistant. Context from earlier:\n" + session.summary
+    : "You are a helpful assistant.";
+
+  const aiStream = await env.AI.run(MODEL, {
+    messages: [{ role: "system", content: systemContent }, ...session.messages],
     stream: true,
   }) as ReadableStream;
 
   let fullText = "";
-  const historyRef = history;
+  const sessionRef = session;
 
   const { readable, writable } = new TransformStream({
     transform(chunk: Uint8Array, controller) {
@@ -61,8 +90,8 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       controller.enqueue(chunk);
     },
     async flush() {
-      historyRef.push({ role: "assistant", content: fullText });
-      await env.MEMORY.put(sessionId, JSON.stringify(historyRef), { expirationTtl: 7200 });
+      sessionRef.messages.push({ role: "assistant", content: fullText });
+      await env.MEMORY.put(sessionId, JSON.stringify(sessionRef), { expirationTtl: 7200 });
     },
   });
 
@@ -79,7 +108,8 @@ const HTML = `<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e0e0e0;height:100dvh;display:flex;flex-direction:column}
-header{padding:14px 20px;border-bottom:1px solid #1e1e1e;font-size:13px;color:#555}
+header{padding:14px 20px;border-bottom:1px solid #1e1e1e;display:flex;justify-content:space-between;font-size:13px;color:#555}
+button.clear{background:none;border:1px solid #2a2a2a;color:#555;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px}
 #messages{flex:1;overflow-y:auto;padding:24px 20px;display:flex;flex-direction:column;gap:14px}
 .msg{max-width:72%;padding:11px 15px;border-radius:12px;font-size:14px;line-height:1.6;white-space:pre-wrap}
 .user{background:#1a3557;align-self:flex-end}
@@ -87,16 +117,19 @@ header{padding:14px 20px;border-bottom:1px solid #1e1e1e;font-size:13px;color:#5
 .ai.streaming::after{content:'\\25ae';animation:blink 0.8s step-end infinite;margin-left:3px;color:#555}
 @keyframes blink{50%{opacity:0}}
 #bottom{padding:16px 20px;border-top:1px solid #1e1e1e;display:flex;gap:8px}
-#input{flex:1;background:#161616;border:1px solid #2a2a2a;color:#e0e0e0;padding:10px 14px;border-radius:8px;font-size:14px;outline:none}
+#input{flex:1;background:#161616;border:1px solid #2a2a2a;color:#e0e0e0;padding:10px 14px;border-radius:8px;font-size:14px;outline:none;resize:none;font-family:inherit}
 #send{background:#2563eb;color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:14px}
 #send:disabled{opacity:0.4;cursor:not-allowed}
 </style>
 </head>
 <body>
-<header>cf_ai_chat &mdash; Llama 3.3 70B (streaming)</header>
-<div id="messages"></div>
+<header>
+  <span>cf_ai_chat &mdash; Llama 3.3 70B</span>
+  <button class="clear" id="clear">New chat</button>
+</header>
+<div id="messages"><div style="margin:auto;color:#333;font-size:14px;text-align:center">Start a conversation. Memory persists across refreshes.</div></div>
 <div id="bottom">
-  <input id="input" placeholder="Message..." />
+  <textarea id="input" rows="1" placeholder="Message..."></textarea>
   <button id="send">Send</button>
 </div>
 <script>
@@ -117,11 +150,10 @@ function addMsg(role, streaming) {
 async function send() {
   var text = inp.value.trim();
   if (!text || btn.disabled) return;
-  inp.value = '';
+  inp.value = ''; inp.style.height = 'auto';
   btn.disabled = true;
   addMsg('user', false).textContent = text;
   var aiEl = addMsg('ai', true);
-
   try {
     var res = await fetch('/chat', {
       method: 'POST',
@@ -141,24 +173,22 @@ async function send() {
       for (var i = 0; i < lines.length; i++) {
         var line = lines[i];
         if (line.startsWith('data: ') && line.indexOf('[DONE]') === -1) {
-          try {
-            var data = JSON.parse(line.slice(6));
-            if (data.response) { fullText += data.response; aiEl.textContent = fullText; msgs.scrollTop = msgs.scrollHeight; }
-          } catch(e) {}
+          try { var data = JSON.parse(line.slice(6)); if (data.response) { fullText += data.response; aiEl.textContent = fullText; msgs.scrollTop = msgs.scrollHeight; } } catch(e) {}
         }
       }
     }
     aiEl.classList.remove('streaming');
-  } catch(e) {
-    aiEl.classList.remove('streaming');
-    aiEl.textContent = 'Error reaching server.';
-  }
-  btn.disabled = false;
-  inp.focus();
+  } catch(e) { aiEl.classList.remove('streaming'); aiEl.textContent = 'Error.'; }
+  btn.disabled = false; inp.focus();
 }
 
 btn.addEventListener('click', send);
-inp.addEventListener('keydown', function(e) { if (e.key === 'Enter') send(); });
+inp.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+inp.addEventListener('input', function() { inp.style.height = 'auto'; inp.style.height = Math.min(inp.scrollHeight, 160) + 'px'; });
+document.getElementById('clear').addEventListener('click', async function() {
+  await fetch('/session', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ sessionId: sid }) });
+  sid = crypto.randomUUID(); localStorage.setItem('cf_sid', sid); msgs.innerHTML = '';
+});
 </script>
 </body>
 </html>`;
